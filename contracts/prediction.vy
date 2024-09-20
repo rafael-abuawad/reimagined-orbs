@@ -18,7 +18,7 @@ from ethereum.ercs import IERC20Detailed
 
 
 # @dev We import the `AggregatorV3` interface.
-from .interfaces import AggregatorV3
+from .interfaces import IAggregatorV3
 
 
 # @dev We import and initialise the `ownable` module.
@@ -80,9 +80,9 @@ _ASSET: immutable(IERC20)
 oracle: public(immutable(address))
 
 
-# @dev Stores the AggregatorV3 interface object of the underlying
+# @dev Stores the Aggregator V3 interface object of the underlying
 # oravle used for the protocol
-_ORACLE: immutable(AggregatorV3)
+_ORACLE: immutable(IAggregatorV3)
 
 
 # @dev Returns the number of seconds for a valid 
@@ -262,7 +262,7 @@ event Unpause:
 @payable
 def __init__(
     asset_: IERC20,
-    oracle_: AggregatorV3,
+    oracle_: IAggregatorV3,
     adminAddress_: address,
     operatorAddress_: address,
     intervalSeconds_: uint256,
