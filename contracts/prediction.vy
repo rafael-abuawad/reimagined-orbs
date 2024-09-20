@@ -17,8 +17,8 @@ from ethereum.ercs import IERC20
 from ethereum.ercs import IERC20Detailed
 
 
-# @dev We import the `AggregatorV3Interface` interface.
-from .interfaces import AggregatorV3Interface
+# @dev We import the `AggregatorV3` interface.
+from .interfaces import AggregatorV3
 
 
 # @dev We import and initialise the `ownable` module.
@@ -73,6 +73,16 @@ asset: public(immutable(address))
 # @dev Stores the ERC-20 interface object of the underlying
 # token used for the protocol
 _ASSET: immutable(IERC20)
+
+
+# @dev Returns the address of the underlying oracle
+# used for the protocl.
+oracle: public(immutable(address))
+
+
+# @dev Stores the AggregatorV3 interface object of the underlying
+# oravle used for the protocol
+_ORACLE: immutable(AggregatorV3)
 
 
 # @dev Returns the number of seconds for a valid 
@@ -250,18 +260,65 @@ event Unpause:
 
 @deploy
 @payable
-def __init__(asset_: IERC20,):
+def __init__(
+    asset_: IERC20,
+    oracle_: AggregatorV3,
+    adminAddress_: address,
+    operatorAddress_: address,
+    intervalSeconds_: uint256,
+    bufferSeconds_: uint256,
+    minBetAmount_: uint256,
+    oracleUpdateAllowance_: uint256,
+    treasuryFee_: uint256
+):
     """
     @dev To omit the opcodes for checking the `msg.value`
          in the creation-time EVM bytecode, the constructor
          is declared as `payable`.
+    
     @param asset_ The ERC-20 compatible (i.e. ERC-777 is also viable)
            underlying asset contract.
+    
+    @param oracle_ The address of the Chainlink Aggregator V3 oracle contract
+           used to provide price feed data for the application.
+    
+    @param intervalSeconds_ The interval, in seconds, at which the price
+           updates occur, determining how often the contract fetches new
+           price information from the oracle.
+    
+    @param bufferSeconds_ The buffer time, in seconds, that must elapse
+           before a new betting round can start, ensuring smooth transitions
+           between rounds.
+    
+    @param minBetAmount_ The minimum amount of currency that users
+           can wager when placing a bet, designed to ensure that bets
+           are of a meaningful size.
+    
+    @param oracleUpdateAllowance_ The allowance period, in seconds,
+           within which the oracle is expected to update the price feed,
+           helping to maintain timely information.
+    
+    @param treasuryFee_ The fee collected for the treasury, which can be
+           used for various operational costs or for funding other aspects
+           of the protocol.
+
     @notice The `owner` role will be assigned to
             the `msg.sender`.
     """
+    # Check that the treasury fee is not greater than the maximum allowed
+    assert treasuryFee_ <= MAX_TREASURY_FEE, "Treasury fee too high"
+
     _ASSET = asset_
     asset = _ASSET.address
+
+    _ORACLE = oracle_
+    oracle = _ORACLE.address
+
+    self.intervalSeconds = intervalSeconds_
+    self.bufferSeconds = bufferSeconds_
+    self.minBetAmount = minBetAmount_
+    self.oracleUpdateAllowance = oracleUpdateAllowance_
+    self.treasuryFee = treasuryFee_
 
     # The following line assigns the `owner`
     # to the `msg.sender`.
@@ -269,6 +326,7 @@ def __init__(asset_: IERC20,):
 
 
 @internal
+@view
 def _not_contract():
     """
     @dev Internal function to ensure the caller is
