@@ -1,0 +1,10 @@
+name: reimagined-orbs
+
+plugins:
+  - name: vyper
+  - name: foundry
+
+dependencies:
+  - python: snekmate
+    config_override:
+      contracts_folder: .
