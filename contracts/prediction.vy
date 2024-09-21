@@ -110,6 +110,15 @@ treasuryFee: public(uint256)
 treasuryAmount: public(uint256)
 
 
+# @dev Returns the current epoch for the ongoing
+# prediction round
+currentEpoch: public(uint256)
+
+
+# @dev Returns if the protocol is Paused.
+_paused: bool
+
+
 # @dev Returns the latests Round ID from
 # the Aggregator Oracle (converted from uint80) 
 # TODO: REVIEW DOC
@@ -275,33 +284,25 @@ def __init__(
     @dev To omit the opcodes for checking the `msg.value`
          in the creation-time EVM bytecode, the constructor
          is declared as `payable`.
-    
     @param asset_ The ERC-20 compatible (i.e. ERC-777 is also viable)
            underlying asset contract.
-    
     @param oracle_ The address of the Chainlink Aggregator V3 oracle contract
            used to provide price feed data for the application.
-    
     @param intervalSeconds_ The interval, in seconds, at which the price
            updates occur, determining how often the contract fetches new
            price information from the oracle.
-    
     @param bufferSeconds_ The buffer time, in seconds, that must elapse
            before a new betting round can start, ensuring smooth transitions
            between rounds.
-    
     @param minBetAmount_ The minimum amount of currency that users
            can wager when placing a bet, designed to ensure that bets
            are of a meaningful size.
-    
     @param oracleUpdateAllowance_ The allowance period, in seconds,
            within which the oracle is expected to update the price feed,
            helping to maintain timely information.
-    
     @param treasuryFee_ The fee collected for the treasury, which can be
            used for various operational costs or for funding other aspects
            of the protocol.
-
     @notice The `owner` role will be assigned to
             the `msg.sender`.
     """
@@ -334,3 +335,175 @@ def _not_contract():
     """
     assert not msg.sender.is_contract, "Contract not allowed"
     assert msg.sender == tx.origin, "Proxy contract not allowed"
+
+
+@internal
+@view
+def _when_not_paused():
+    """
+    @dev Internal function to ensure the protocol is
+         not paused.
+    """
+    assert not self._paused, "Contract is paused"
+
+
+@internal
+@view
+def _bettable(epoch: uint256) -> bool:
+    """
+    @notice Determines whether a given round (epoch)
+            is in a bettable state.
+    @param epoch The epoch (round) to check.
+    @return bool True if the round is bettable, False otherwise.
+
+        A round is considered bettable if:
+        - It has a valid start timestamp (non-zero).
+        - It has a valid lock timestamp (non-zero).
+        - The current block timestamp is between the start and lock timestamps.
+    """
+    r: Round = self.rounds[epoch]
+    return (
+        r.startTimestamp != 0 and
+        r.lockTimestamp != 0 and
+        block.timestamp > r.startTimestamp and
+        block.timestamp < r.lockTimestamp
+    )
+
+
+@internal
+@view
+def _claimable(epoch: uint256, user: address) -> bool:
+    """
+    @notice Checks if the user can claim rewards for a specific epoch.
+    @param epoch The epoch (round) to check.
+    @param user The user's address.
+    @return bool True if the user is eligible to claim, False otherwise.
+
+    The claimable status is determined by:
+    - The oracle has provided final price data (oracleCalled).
+    - The user has placed a bet (amount is non-zero).
+    - The user has not already claimed the reward.
+    - The result of the round (whether the user's position won or lost).
+    """
+    
+    betInfo: BetInfo = self.ledger[epoch][user]
+    round: Round = self.rounds[epoch]
+
+    # If the lock price is equal to the close price, no claims can be made.
+    if round.lockPrice == round.closePrice:
+        return False
+
+    # Return true if all conditions are met for a valid claim.
+    return (
+        round.oracleCalled and
+        betInfo.amount != 0 and
+        not betInfo.claimed and
+        (
+            (round.closePrice > round.lockPrice and betInfo.position == Position.Bull) or
+            (round.closePrice < round.lockPrice and betInfo.position == Position.Bear)
+        )
+    )
+
+
+
+@external
+@nonreentrant
+def betBear(epoch: uint256, amount: uint256):
+    """
+    @notice Allows a user to place a bet on the bear position for a specific epoch.
+    @param epoch The epoch in which the bet is placed.
+    @param amount The amount being wagered.
+
+        - The epoch must match the current epoch.
+        - The round must be bettable.
+        - The bet amount must be greater than the minimum bet amount.
+        - The user can only bet once per round.
+    """
+    self._not_contract()
+    self._when_not_paused()
+    assert epoch == self.currentEpoch, "Bet is too early/late"
+    assert self._bettable(epoch), "Round not bettable"
+    assert amount >= self.minBetAmount, "Bet amount must be greater than minBetAmount"
+    assert self.ledger[epoch][msg.sender].amount == 0, "Can only bet once per round"
+
+    # Transfer the bet amount from the user to the contract
+    extcall _ASSET.transferFrom(msg.sender, self, amount)
+
+    # Update round data
+    round: Round = self.rounds[epoch]
+    round.totalAmount += amount
+    round.bearAmount += amount
+
+    # Update user data
+    betInfo: BetInfo = self.ledger[epoch][msg.sender]
+    betInfo.position = Position.Bear
+    betInfo.amount = amount
+
+    i: uint256 = self._userRounds[msg.sender]
+    self._userRounds[msg.sender] += 1
+
+    self.userRounds[msg.sender][i] = epoch
+
+    # Emit event for the bear bet
+    log BetBear(msg.sender, epoch, amount)
+
+
+@external
+@nonreentrant
+def betBull(epoch: uint256, amount: uint256):
+    """
+    @notice Allows a user to place a bet on the bear position for a specific epoch.
+    @param epoch The epoch in which the bet is placed.
+    @param amount The amount being wagered.
+    @dev
+        - The epoch must match the current epoch.
+        - The round must be bettable.
+        - The bet amount must be greater than the minimum bet amount.
+        - The user can only bet once per round.
+    """
+    self._not_contract()
+    self._when_not_paused()
+    assert epoch == self.currentEpoch, "Bet is too early/late"
+    assert self._bettable(epoch), "Round not bettable"
+    assert amount >= self.minBetAmount, "Bet amount must be greater than minBetAmount"
+    assert self.ledger[epoch][msg.sender].amount == 0, "Can only bet once per round"
+
+    # Transfer the bet amount from the user to the contract
+    extcall _ASSET.transferFrom(msg.sender, self, amount)
+
+    # Update round data
+    round: Round = self.rounds[epoch]
+    round.totalAmount += amount
+    round.bearAmount += amount
+
+    # Update user data
+    betInfo: BetInfo = self.ledger[epoch][msg.sender]
+    betInfo.position = Position.Bull
+    betInfo.amount = amount
+
+    i: uint256 = self._userRounds[msg.sender]
+    self._userRounds[msg.sender] += 1
+
+    self.userRounds[msg.sender][i] = epoch
+
+    # Emit event for the bull bet
+    log BetBull(msg.sender, epoch, amount)
+
+
+@external
+@nonreentrant
+def name(epochs: DynArray[uint256, 128]):
+    """
+    @notice Claim reward for an array of epochs
+    @param epochs array of epochs
+    """
+    self._not_contract()
+    self._when_not_paused()
+
+    reward: uint256 = 0
+    
+    for i: uint256 in epochs:
+        r: Round = self.rounds[i]
+
+        assert r.startTimestamp != 0, "Round has not started"
+        assert r.closeTimestamp < block.timestamp, "Round has not ended"
