@@ -65,6 +65,20 @@ struct BetInfo:
     claimed: bool
 
 
+# @dev Returns the address of operator
+operator: public(address)
+
+
+# @dev Tracks whether the genesis lock round has been triggered. This ensures
+# that the price lock for the first round (genesis) is only done once.
+genesisLockOnce: public(bool)
+
+
+# @dev Tracks whether the genesis start round has been triggered. This ensures
+# that the first round (genesis) starts only once and avoids multiple initiations.
+genesisStartOnce: public(bool)
+
+
 # @dev Returns the address of the underlying token
 # used for the protocl.
 asset: public(immutable(address))
@@ -116,12 +130,11 @@ currentEpoch: public(uint256)
 
 
 # @dev Returns if the protocol is Paused.
-_paused: bool
+paused: public(bool)
 
 
 # @dev Returns the latests Round ID from
 # the Aggregator Oracle (converted from uint80) 
-# TODO: REVIEW DOC
 oracleLatestRoundId: public(uint256)
 
 
@@ -238,6 +251,11 @@ event Pause:
     epoch: indexed(uint256)
 
 
+# @dev Log when the contract is unpaused for a specific epoch
+event Unpause:
+    epoch: indexed(uint256)
+
+
 # @dev Log when rewards are calculated for a specific epoch
 event RewardsCalculated:
     epoch: indexed(uint256)
@@ -260,11 +278,6 @@ event TokenRecovery:
 # @dev Log when the treasury claims its funds
 event TreasuryClaim:
     amount: uint256
-
-
-# @dev Log when the contract is unpaused for a specific epoch
-event Unpause:
-    epoch: indexed(uint256)
 
 
 @deploy
@@ -333,8 +346,8 @@ def _not_contract():
     @dev Internal function to ensure the caller is
          not a contract or a proxy contract
     """
-    assert not msg.sender.is_contract, "Contract not allowed"
-    assert msg.sender == tx.origin, "Proxy contract not allowed"
+    assert not msg.sender.is_contract, "prediction: contract not allowed"
+    assert msg.sender == tx.origin, "prediction: proxy contract not allowed"
 
 
 @internal
@@ -344,7 +357,17 @@ def _when_not_paused():
     @dev Internal function to ensure the protocol is
          not paused.
     """
-    assert not self._paused, "Contract is paused"
+    assert not self.paused, "prediction: contract is paused"
+
+
+@internal
+@view
+def _only_operator():
+    """
+    @dev Internal function to ensure the method is
+         called only by the operator
+    """
+    assert msg.sender == self.operator, "prediction: contract is paused"
 
 
 @internal
@@ -393,7 +416,6 @@ def _claimable(epoch: uint256, user: address) -> bool:
     if round.lockPrice == round.closePrice:
         return False
 
-    # Return true if all conditions are met for a valid claim.
     return (
         round.oracleCalled and
         betInfo.amount != 0 and
@@ -403,18 +425,6 @@ def _claimable(epoch: uint256, user: address) -> bool:
             (round.closePrice < round.lockPrice and betInfo.position == Position.Bear)
         )
     )
-
-
-@external
-@view
-def claimable(epoch: uint256, user: address) -> bool:
-    """
-    @notice Checks if the user can claim rewards for a specific epoch.
-    @param epoch The epoch (round) to check.
-    @param user The user's address.
-    @return bool True if the user is eligible to claim, False otherwise.
-    """
-    return self._claimable(epoch, user)
 
 
 @internal
@@ -440,9 +450,160 @@ def _refundable(epoch: uint256, user: address) -> bool:
     return (
         not round.oracleCalled and
         not betInfo.claimed and
-        block.timestamp > round.closeTimestamp + bufferSeconds and  
+        block.timestamp > round.closeTimestamp + self.bufferSeconds and  
         betInfo.amount != 0
     )
+
+@internal
+@view
+def _get_price_from_oracle() -> (uint80, int256):
+    """
+    @notice Get the latest recorded price from the oracle.
+    @dev Ensures the oracle has updated within the allowed time buffer and checks
+         that the oracle's round ID is valid (greater than the latest stored round ID).
+    @return roundId The round ID from the oracle.
+    @return price The latest price from the oracle.
+    """
+    least_allowed_timestamp: uint256 = block.timestamp + self.oracleUpdateAllowance
+
+    roundId: uint80 = 0
+    answer: int256 = 0
+    startedAt: uint256 = 0
+    updatedAt: uint256 = 0
+    answeredInRound: uint80 = 0
+    (roundId, answer, startedAt, updatedAt, answeredInRound) = staticcall _ORACLE.latestRoundData()
+
+    assert block.timestamp <= least_allowed_timestamp, "prediction: oracle update exceeded max timestamp allowance"
+    assert convert(roundId, uint256) > self.oracleLatestRoundId, "prediction: oracle update roundId must be larger than oracleLatestRoundId"
+
+    return roundId, answer
+
+
+@internal
+def _safe_end_round(epoch: uint256, roundId: uint256, price: int256):
+    """
+    @notice End a specific round by locking in the closing price and oracle round ID.
+    @dev This function ensures the round is locked and can only be ended after the closeTimestamp,
+         but within the bufferSeconds.
+    @param epoch The epoch of the round to be ended.
+    @param roundId The oracle's round ID for this round.
+    @param price The closing price for this round.
+    """
+    r: Round = self.rounds[epoch]
+
+    assert r.lockTimestamp != 0, "prediction: can only end round after round has locked"
+    assert block.timestamp >= r.closeTimestamp, "prediction: can only end round after closeTimestamp"
+    assert block.timestamp <= r.closeTimestamp + self.bufferSeconds, "Can only end round within bufferSeconds"
+
+    self.rounds[epoch].closePrice = price
+    self.rounds[epoch].closeOracleId = roundId
+    self.rounds[epoch].oracleCalled = True
+    log EndRound(epoch, roundId, r.closePrice)
+
+
+@internal
+def _safe_lock_round(epoch: uint256, roundId: uint256, price: int256):
+    """
+    @notice Lock a specific round by setting the lock price and oracle round ID.
+    @dev This function ensures that the round has started and can only be locked after the lockTimestamp,
+         but within the bufferSeconds.
+    @param epoch The epoch of the round to be locked.
+    @param roundId The oracle's round ID for this round.
+    @param price The locking price for this round.
+    """
+    r: Round = self.rounds[epoch]
+
+    assert r.startTimestamp != 0, "prediction: can only lock round after round has started"
+    assert block.timestamp >= r.lockTimestamp, "prediction: can only lock round after lockTimestamp"
+    assert block.timestamp <= r.lockTimestamp + self.bufferSeconds, "prediction: can only lock round within bufferSeconds"
+
+    self.rounds[epoch].closeTimestamp = block.timestamp + self.intervalSeconds
+    self.rounds[epoch].lockPrice = price
+    self.rounds[epoch].lockOracleId = roundId
+    log LockRound(epoch, roundId, r.lockPrice)
+
+
+@internal
+def _start_round(epoch: uint256):
+    """
+    @notice Start a specific round by initializing the round's timestamps and setting the epoch.
+    @dev This function sets the start, lock, and close timestamps for the new round and resets the total amount.
+    @param epoch The epoch of the new round to be started.
+    """
+    self.rounds[epoch].startTimestamp = block.timestamp
+    self.rounds[epoch].lockTimestamp = block.timestamp + self.intervalSeconds
+    self.rounds[epoch].closeTimestamp = block.timestamp + (2 * self.intervalSeconds)
+    self.rounds[epoch].epoch = epoch
+    self.rounds[epoch].totalAmount = 0
+
+    log StartRound(epoch)
+
+
+@internal
+def _safe_start_round(epoch: uint256):
+    """
+    @notice Start a new round by validating the status of previous rounds.
+    @dev This function ensures that the genesis round has started and the n-2 round has ended before
+         starting a new round.
+    @param epoch The epoch of the new round to be started.
+    """
+    assert self.genesisStartOnce, "prediction: can only run after genesisStartRound is triggered"
+    assert self.rounds[epoch - 2].closeTimestamp != 0, "prediction: can only start round after round n-2 has ended"
+    assert block.timestamp >= self.rounds[epoch - 2].closeTimestamp, "prediction: can only start new round after round n-2 closeTimestamp"
+
+    self._start_round(epoch)
+
+
+@internal
+def _calculate_rewards(epoch: uint256):
+    """
+    @notice Calculate the rewards for a specific round based on the closing and locking prices.
+    @dev Rewards are calculated based on the comparison of the closing price with the locking price.
+         The function handles three scenarios: bull wins, bear wins, and house wins.
+    @param epoch The epoch of the round for which rewards are being calculated.
+    """
+    r: Round = self.rounds[epoch]
+    assert r.rewardBaseCalAmount == 0 and r.rewardAmount == 0, "prediction: rewards already calculated"
+
+    reward_base_cal_amount: uint256 = 0
+    treasury_amt: uint256 = 0
+    reward_amount: uint256 = 0
+
+    # Bull wins (close price is greater than lock price)
+    if r.closePrice > r.lockPrice:
+        reward_base_cal_amount = r.bullAmount
+        treasury_amt = (r.totalAmount * self.treasuryFee) // 10000
+        reward_amount = r.totalAmount - treasury_amt
+
+    # Bear wins (close price is less than lock price)
+    elif r.closePrice < r.lockPrice:
+        reward_base_cal_amount = r.bearAmount
+        treasury_amt = (r.totalAmount * self.treasuryFee) // 10000
+        reward_amount = r.totalAmount - treasury_amt
+
+    # House wins (close price equals lock price)
+    else:
+        reward_base_cal_amount = 0
+        reward_amount = 0
+        treasury_amt = r.totalAmount
+
+    self.rounds[epoch].rewardBaseCalAmount = reward_base_cal_amount
+    self.rounds[epoch].rewardAmount = reward_amount
+
+    self.treasuryAmount += treasury_amt
+    log RewardsCalculated(epoch, reward_base_cal_amount, reward_amount, treasury_amt)
+
+
+@external
+@view
+def claimable(epoch: uint256, user: address) -> bool:
+    """
+    @notice Checks if the user can claim rewards for a specific epoch.
+    @param epoch The epoch (round) to check.
+    @param user The user's address.
+    @return bool True if the user is eligible to claim, False otherwise.
+    """
+    return self._claimable(epoch, user)
 
 
 @external
@@ -472,20 +633,17 @@ def betBear(epoch: uint256, amount: uint256):
     """
     self._not_contract()
     self._when_not_paused()
+    
     assert epoch == self.currentEpoch, "Bet is too early/late"
     assert self._bettable(epoch), "Round not bettable"
     assert amount >= self.minBetAmount, "Bet amount must be greater than minBetAmount"
     assert self.ledger[epoch][msg.sender].amount == 0, "Can only bet once per round"
 
-    # Transfer the bet amount from the user to the contract
     extcall _ASSET.transferFrom(msg.sender, self, amount)
 
-    # Update round data
-    round: Round = self.rounds[epoch]
-    round.totalAmount += amount
-    round.bearAmount += amount
+    self.rounds[epoch].totalAmount += amount
+    self.rounds[epoch].bearAmount += amount
 
-    # Update user data
     betInfo: BetInfo = self.ledger[epoch][msg.sender]
     betInfo.position = Position.Bear
     betInfo.amount = amount
@@ -495,7 +653,6 @@ def betBear(epoch: uint256, amount: uint256):
 
     self.userRounds[msg.sender][i] = epoch
 
-    # Emit event for the bear bet
     log BetBear(msg.sender, epoch, amount)
 
 
@@ -514,30 +671,25 @@ def betBull(epoch: uint256, amount: uint256):
     """
     self._not_contract()
     self._when_not_paused()
+
     assert epoch == self.currentEpoch, "prediction: bet is too early/late"
     assert self._bettable(epoch), "prediction: round not bettable"
     assert amount >= self.minBetAmount, "prediction: bet amount must be greater than minBetAmount"
     assert self.ledger[epoch][msg.sender].amount == 0, "prediction: can only bet once per round"
 
-    # Transfer the bet amount from the user to the contract
     extcall _ASSET.transferFrom(msg.sender, self, amount)
 
-    # Update round data
-    round: Round = self.rounds[epoch]
-    round.totalAmount += amount
-    round.bearAmount += amount
+    self.rounds[epoch].totalAmount += amount
+    self.rounds[epoch].bearAmount += amount
 
-    # Update user data
     betInfo: BetInfo = self.ledger[epoch][msg.sender]
     betInfo.position = Position.Bull
     betInfo.amount = amount
 
     i: uint256 = self._userRounds[msg.sender]
     self._userRounds[msg.sender] += 1
-
     self.userRounds[msg.sender][i] = epoch
 
-    # Emit event for the bull bet
     log BetBull(msg.sender, epoch, amount)
 
 
@@ -573,4 +725,124 @@ def claim(epochs: DynArray[uint256, 128]):
         log Claim(msg.sender, epoch, addedReward)
 
     if reward > 0:
-        _ASSET.transfer(msg.sender, reward)
+        extcall _ASSET.transfer(msg.sender, reward)
+
+
+@external
+@nonreentrant
+def executeRound():
+    """
+    @notice Start the next round (n), lock price for round (n-1), and end round (n-2)
+    @dev Callable only by the operator. Requires that genesisStartRound and
+         genesisLockRound have been triggered before this can be executed.
+    """
+    self._when_not_paused()
+    self._only_operator()
+
+    assert self.genesisStartOnce and self.genesisLockOnce, "prediction: an only run after genesisStartRound and genesisLockRound is triggered"
+
+    currentRoundId: uint80 = 0
+    currentPrice: int256 = 0
+    currentRoundId, currentPrice = self._get_price_from_oracle()
+
+    oracleLatestRoundId: uint256 = convert(currentRoundId, uint256)
+    self.oracleLatestRoundId = oracleLatestRoundId
+
+    self._safe_lock_round(self.currentEpoch, oracleLatestRoundId, currentPrice)
+    self._safe_end_round(self.currentEpoch - 1, oracleLatestRoundId, currentPrice)
+
+    self._calculate_rewards(self.currentEpoch - 1)
+
+    self.currentEpoch += 1
+    self._safe_start_round(self.currentEpoch)
+
+
+@external
+@nonreentrant
+def genesisLockRound():
+    """
+    @notice Lock the genesis round.
+    @dev This function is callable by the operator and locks the current genesis round.
+         It requires that the genesis start round has been triggered and that the genesis lock round
+         has not been executed yet. After locking, it starts the next round and updates the state.
+    """
+    assert self.genesisStartOnce, "prediction: can only run after genesisStartRound is triggered"
+    assert not self.genesisLockOnce, "prediction: can only run genesisLockRound once"
+
+    current_round_id: uint80 = 0
+    current_price: int256 = 0
+    current_round_id, current_price = self._get_price_from_oracle()
+
+    oracleLatestRoundId: uint256 = convert(current_round_id, uint256)
+    self.oracleLatestRoundId = oracleLatestRoundId 
+
+    self._safe_lock_round(self.currentEpoch, oracleLatestRoundId, current_price)
+    self.currentEpoch += 1
+
+    self._start_round(self.currentEpoch)
+    self.genesisLockOnce = True
+
+
+@external
+@nonreentrant
+def genesisStartRound():
+    """
+    @notice Start the genesis round.
+    @dev This function is callable by the operator and starts the genesis round.
+         It can only be run once to initialize the first round of the protocol.
+    """
+    assert not self.genesisStartOnce, "prediction: an only run genesisStartRound once"
+    self.currentEpoch += 1
+    self._start_round(self.currentEpoch)
+    self.genesisStartOnce = True
+
+
+@external
+@nonreentrant
+def pause():
+    """
+    @notice Pauses the contract, triggering a stopped state.
+    @dev Callable by admin or operator. Once paused, the contract enters a stopped state
+         and cannot be interacted with for certain functions until unpaused.
+    """
+    assert not self.paused, "Contract is already paused"
+    ow._check_owner()
+
+    self.paused = True
+    log Pause(self.currentEpoch)
+
+
+@external
+@nonreentrant
+def claim_treasury():
+    """
+    @notice Claim all rewards stored in the treasury.
+    @dev Callable by admin only. This function transfers all the treasury funds to the admin address
+         and resets the treasury amount to zero.
+    """
+    ow._check_owner()
+
+    current_treasury_amount: uint256 = self.treasuryAmount
+    self.treasuryAmount = 0
+
+    extcall _ASSET.transfer(ow.owner, current_treasury_amount)
+
+    log TreasuryClaim(current_treasury_amount)
+
+
+@external
+@nonreentrant
+def unpause():
+    """
+    @notice Unpauses the contract and returns to normal operation.
+    @dev Callable by admin or operator. This function resets the genesis state, and once unpaused,
+         the rounds need to be restarted by triggering the genesis start. 
+    """
+    assert self.paused, "Contract is not paused"
+    ow._check_owner()
+
+    self.genesisStartOnce = False
+    self.genesisLockOnce = False
+    self.paused = False
+
+    log Unpause(self.currentEpoch)
