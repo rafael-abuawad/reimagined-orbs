@@ -140,11 +140,10 @@ oracleLatestRoundId: public(uint256)
 
 # @dev Returns the interfal of seconds
 # between each oracle allowance update
-# TODO: REVIEW DOC
 oracleUpdateAllowance: public(uint256)
 
 
-# @dev Returns The maximun fee that can be
+# @dev Returns the maximun fee that can be
 # set by the protocol's owner. (10%)
 MAX_TREASURY_FEE: public(constant(uint256)) = 1000 
 
@@ -171,6 +170,11 @@ _userRounds: HashMap[address, uint256]
 # Structure:
 #   address => Index => Round ID
 userRounds: public(HashMap[address, HashMap[uint256, uint256]])
+
+
+# @dev Returns limit of user rounds that can
+# be queried
+USER_ROUNDS_BOUND: constant(uint256) = max_value(uint256)
 
 
 # @dev Log when a user places a Bear bet
@@ -362,12 +366,23 @@ def _when_not_paused():
 
 @internal
 @view
+def _when_paused():
+    """
+    @dev Internal function to ensure the protocol is
+         paused.
+    """
+    assert self.paused, "prediction: contract is not paused"
+
+
+
+@internal
+@view
 def _only_operator():
     """
     @dev Internal function to ensure the method is
          called only by the operator
     """
-    assert msg.sender == self.operator, "prediction: contract is paused"
+    assert msg.sender == self.operator, "prediction: caller is not operator"
 
 
 @internal
@@ -738,7 +753,6 @@ def executeRound():
     """
     self._when_not_paused()
     self._only_operator()
-
     assert self.genesisStartOnce and self.genesisLockOnce, "prediction: an only run after genesisStartRound and genesisLockRound is triggered"
 
     currentRoundId: uint80 = 0
@@ -766,6 +780,7 @@ def genesisLockRound():
          It requires that the genesis start round has been triggered and that the genesis lock round
          has not been executed yet. After locking, it starts the next round and updates the state.
     """
+    self._only_operator()
     assert self.genesisStartOnce, "prediction: can only run after genesisStartRound is triggered"
     assert not self.genesisLockOnce, "prediction: can only run genesisLockRound once"
 
@@ -791,7 +806,9 @@ def genesisStartRound():
     @dev This function is callable by the operator and starts the genesis round.
          It can only be run once to initialize the first round of the protocol.
     """
+    self._only_operator()
     assert not self.genesisStartOnce, "prediction: an only run genesisStartRound once"
+
     self.currentEpoch += 1
     self._start_round(self.currentEpoch)
     self.genesisStartOnce = True
@@ -802,11 +819,11 @@ def genesisStartRound():
 def pause():
     """
     @notice Pauses the contract, triggering a stopped state.
-    @dev Callable by admin or operator. Once paused, the contract enters a stopped state
+    @dev Callable the owner. Once paused, the contract enters a stopped state
          and cannot be interacted with for certain functions until unpaused.
     """
-    assert not self.paused, "Contract is already paused"
     ow._check_owner()
+    assert not self.paused, "Contract is already paused"
 
     self.paused = True
     log Pause(self.currentEpoch)
@@ -835,14 +852,143 @@ def claim_treasury():
 def unpause():
     """
     @notice Unpauses the contract and returns to normal operation.
-    @dev Callable by admin or operator. This function resets the genesis state, and once unpaused,
+    @dev Callable by owner. This function resets the genesis state, and once unpaused,
          the rounds need to be restarted by triggering the genesis start. 
     """
-    assert self.paused, "Contract is not paused"
     ow._check_owner()
+    assert self.paused, "Contract is not paused"
 
     self.genesisStartOnce = False
     self.genesisLockOnce = False
     self.paused = False
 
     log Unpause(self.currentEpoch)
+
+
+@external
+def setBufferAndIntervalSeconds(bufferSeconds: uint256, intervalSeconds: uint256):
+    """
+    @notice Set buffer and interval (in seconds)
+    @param bufferSeconds The buffer duration in seconds
+    @param intervalSeconds The interval duration in seconds
+    @dev Callable by admin when paused
+    """
+    ow._check_owner()
+    self._when_paused()
+    assert bufferSeconds < intervalSeconds, "prediction: bufferSeconds must be inferior to intervalSeconds"
+    
+    self.bufferSeconds = bufferSeconds
+    self.intervalSeconds = intervalSeconds
+
+    log NewBufferAndIntervalSeconds(bufferSeconds, intervalSeconds)
+
+
+@external
+def setMinBetAmount(minBetAmount: uint256):
+    """
+    @notice Set the minimum bet amount
+    @param minBetAmount The minimum amount that can be bet
+    @dev Callable by admin when the contract is paused
+    """
+    ow._check_owner()
+    self._when_paused()
+    assert minBetAmount != 0, "prediction: minBetAmount must be greater than 0"
+    
+    self.minBetAmount = minBetAmount
+    log NewMinBetAmount(self.currentEpoch, minBetAmount)
+
+
+@external
+def setOperator(operator: address):
+    """
+    @notice Set the operator address
+    @param operator The address of the new operator
+    @dev Callable by admin
+    """
+    ow._check_owner()
+    assert operator != empty(address), "prediction: operator cannot be zero address"
+    self.operator = operator
+    log NewOperatorAddress(operator)
+
+
+@external
+def setOracleUpdateAllowance(oracleUpdateAllowance: uint256):
+    """
+    @notice Set the oracle update allowance in seconds
+    @param oracleUpdateAllowance New allowance value for oracle updates
+    @dev Callable by admin when paused
+    """
+    ow._check_owner()
+
+    self.oracleUpdateAllowance = oracleUpdateAllowance
+    log NewOracleUpdateAllowance(oracleUpdateAllowance)
+
+
+@external
+def setTreasuryFee(treasuryFee: uint256):
+    """
+    @notice Set the treasury fee percentage
+    @param treasuryFee New treasury fee, must not exceed the max allowed
+    @dev Callable by admin when paused
+    """
+    ow._check_owner()
+    assert treasuryFee <= MAX_TREASURY_FEE, "prediction: Treasury fee too high"
+    
+    self.treasuryFee = treasuryFee
+    log NewTreasuryFee(self.currentEpoch, treasuryFee)
+
+
+@external
+@nonreentrant
+def recoverToken(token: address, amount: uint256):
+    """
+    @notice Allows the owner to recover tokens mistakenly sent to the contract
+    @param token The token address
+    @param amount The amount of tokens to recover
+    @dev Callable by the contract owner
+    """
+    ow._check_owner()
+    assert token != _ASSET.address, "prediction: cannot be prediction token address"
+
+    extcall IERC20(token).transfer(msg.sender, amount)
+    log TokenRecovery(token, amount)
+
+
+@view
+@external
+def getUserRounds(user: address, cursor: uint256, size: uint256) -> (DynArray[uint256, 1024], DynArray[BetInfo, 1024], uint256):
+    """
+    @notice Returns round epochs and bet information for a user that has participated
+    @param user The address of the user
+    @param cursor The cursor (starting point in the userRounds array)
+    @param size The number of rounds to retrieve
+    @return A tuple containing:
+        - A list of round epochs the user has participated in
+        - A list of bet information associated with the rounds
+        - The updated cursor after retrieving the requested rounds
+    """
+    length: uint256 = size
+
+    if length > self._userRounds[user] - cursor:
+        length = self._userRounds[user] - cursor
+
+    values: DynArray[uint256, 1024] = []
+    betInfo: DynArray[BetInfo, 1024] = []
+
+    for i: uint256 in range(length, bound=USER_ROUNDS_BOUND):
+        round_epoch: uint256 = self.userRounds[user][cursor + i]
+        values.append(round_epoch)
+        betInfo.append(self.ledger[round_epoch][user])
+
+    return values, betInfo, cursor + length
+
+
+@view
+@external
+def getUserRoundsLength(user: address) -> uint256:
+    """
+    @notice Returns the number of rounds a user has participated in
+    @param user The address of the user
+    @return The length of the userRounds list for the user
+    """
+    return self._userRounds[user]
